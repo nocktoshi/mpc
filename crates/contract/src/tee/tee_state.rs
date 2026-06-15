@@ -148,6 +148,7 @@ impl TeeState {
         node_id: NodeId,
         attestation: Attestation,
         tee_upgrade_deadline_duration: Duration,
+        launcher_unused_ttl: Duration,
     ) -> Result<ParticipantInsertion, AttestationSubmissionError> {
         let expected_report_data: ReportData = ReportDataV1::new(
             *node_id.tls_public_key.as_bytes(),
@@ -163,11 +164,18 @@ impl TeeState {
             expected_report_data.into(),
             Self::current_time_seconds(),
             &self.get_allowed_mpc_docker_image_hashes(tee_upgrade_deadline_duration),
-            &self.get_allowed_launcher_compose_hashes(),
+            &self.get_allowed_launcher_compose_hashes(launcher_unused_ttl),
             &accepted_measurements,
         )?;
 
         log_informational_advisory_ids(&advisory_ids);
+
+        // Refresh on use: mark the launcher image this attestation validated against
+        // as recently attested so it does not expire while still in active use.
+        if let Some(launcher_compose_hash) = verified_attestation.launcher_compose_hash() {
+            self.allowed_launcher_images
+                .refresh_last_attested(&launcher_compose_hash);
+        }
 
         let tls_pk = node_id.tls_public_key.clone();
 
@@ -200,10 +208,12 @@ impl TeeState {
         &self,
         node_id: &NodeId,
         tee_upgrade_deadline_duration: Duration,
+        launcher_unused_ttl: Duration,
     ) -> TeeQuoteStatus {
         let allowed_mpc_docker_image_hashes =
             self.get_allowed_mpc_docker_image_hashes(tee_upgrade_deadline_duration);
-        let allowed_launcher_compose_hashes = self.get_allowed_launcher_compose_hashes();
+        let allowed_launcher_compose_hashes =
+            self.get_allowed_launcher_compose_hashes(launcher_unused_ttl);
         let allowed_measurements = self.get_accepted_measurements();
 
         let participant_attestation = self.stored_attestations.get(&node_id.tls_public_key);
@@ -232,6 +242,7 @@ impl TeeState {
         &mut self,
         participants: &Participants,
         tee_upgrade_deadline_duration: Duration,
+        launcher_unused_ttl: Duration,
     ) -> TeeValidationResult {
         self.allowed_docker_image_hashes
             .cleanup_expired_hashes(tee_upgrade_deadline_duration);
@@ -249,8 +260,11 @@ impl TeeState {
                     return false;
                 };
 
-                let tee_status =
-                    self.reverify_participants(&node_id, tee_upgrade_deadline_duration);
+                let tee_status = self.reverify_participants(
+                    &node_id,
+                    tee_upgrade_deadline_duration,
+                    launcher_unused_ttl,
+                );
 
                 matches!(tee_status, TeeQuoteStatus::Valid)
             })
@@ -308,9 +322,12 @@ impl TeeState {
             .insert(tee_proposal, tee_upgrade_deadline_duration);
     }
 
-    /// Returns all allowed launcher compose hashes (flattened from all allowed launcher images).
-    pub fn get_allowed_launcher_compose_hashes(&self) -> Vec<LauncherDockerComposeHash> {
-        self.allowed_launcher_images.all_compose_hashes()
+    /// Returns all allowed launcher compose hashes (flattened from all non-expired launcher images).
+    pub fn get_allowed_launcher_compose_hashes(
+        &self,
+        ttl: Duration,
+    ) -> Vec<LauncherDockerComposeHash> {
+        self.allowed_launcher_images.all_compose_hashes(ttl)
     }
 
     /// Casts a vote for adding or removing a launcher image hash.
@@ -344,9 +361,14 @@ impl TeeState {
         self.allowed_launcher_images.remove(launcher_hash)
     }
 
-    /// Returns all allowed launcher image hashes.
-    pub fn get_allowed_launcher_hashes(&self) -> Vec<LauncherImageHash> {
-        self.allowed_launcher_images.launcher_hashes()
+    /// Returns all non-expired allowed launcher image hashes.
+    pub fn get_allowed_launcher_hashes(&self, ttl: Duration) -> Vec<LauncherImageHash> {
+        self.allowed_launcher_images.launcher_hashes(ttl)
+    }
+
+    /// Physically evicts launcher image hashes unused past their TTL.
+    pub fn clean_expired_launcher_images(&mut self, ttl: Duration) {
+        self.allowed_launcher_images.cleanup_expired(ttl);
     }
 
     /// Casts a vote for adding or removing an OS measurement.
@@ -399,11 +421,16 @@ impl TeeState {
     pub fn clean_invalid_attestations(
         &mut self,
         tee_upgrade_deadline_duration: Duration,
+        launcher_unused_ttl: Duration,
         max_scan: usize,
     ) -> u32 {
         let has_invalid_attestation = |node_id: &NodeId| {
             !matches!(
-                self.reverify_participants(node_id, tee_upgrade_deadline_duration),
+                self.reverify_participants(
+                    node_id,
+                    tee_upgrade_deadline_duration,
+                    launcher_unused_ttl
+                ),
                 TeeQuoteStatus::Valid
             )
         };
@@ -574,6 +601,7 @@ mod tests {
                     node_id.clone(),
                     local_attestation.clone(),
                     TEE_UPGRADE_DURATION,
+                    Duration::from_secs(0),
                 )
                 .unwrap();
         }
@@ -582,6 +610,7 @@ mod tests {
                 non_participant_uid.clone(),
                 local_attestation.clone(),
                 TEE_UPGRADE_DURATION,
+                Duration::from_secs(0),
             )
             .unwrap();
 
@@ -643,17 +672,31 @@ mod tests {
         });
 
         tee_state
-            .add_participant(fresh_node.clone(), fresh, Duration::from_secs(0))
+            .add_participant(
+                fresh_node.clone(),
+                fresh,
+                Duration::from_secs(0),
+                Duration::from_secs(0),
+            )
             .unwrap();
         tee_state
-            .add_participant(stale_node.clone(), stale, Duration::from_secs(0))
+            .add_participant(
+                stale_node.clone(),
+                stale,
+                Duration::from_secs(0),
+                Duration::from_secs(0),
+            )
             .unwrap();
 
         assert_eq!(tee_state.stored_attestations.len(), 2);
 
         // When: the clock advances past the stale entry's expiry and cleanup runs.
         set_block_timestamp(NOW_SECONDS * 1_000_000_000);
-        let removed = tee_state.clean_invalid_attestations(Duration::from_secs(0), 100);
+        let removed = tee_state.clean_invalid_attestations(
+            Duration::from_secs(0),
+            Duration::from_secs(0),
+            100,
+        );
 
         // Then: only the expired entry is removed.
         assert_eq!(removed, 1);
@@ -693,7 +736,12 @@ mod tests {
                 account_public_key: bogus_ed25519_public_key(),
             };
             tee_state
-                .add_participant(node_id, expired.clone(), Duration::from_secs(0))
+                .add_participant(
+                    node_id,
+                    expired.clone(),
+                    Duration::from_secs(0),
+                    Duration::from_secs(0),
+                )
                 .unwrap();
         }
         assert_eq!(tee_state.stored_attestations.len(), 10);
@@ -703,7 +751,11 @@ mod tests {
         // When: cleanup is called repeatedly with a scan limit of 3 until no progress is made.
         let mut total_removed = 0u32;
         loop {
-            let removed = tee_state.clean_invalid_attestations(Duration::from_secs(0), 3);
+            let removed = tee_state.clean_invalid_attestations(
+                Duration::from_secs(0),
+                Duration::from_secs(0),
+                3,
+            );
             total_removed += removed;
             if removed == 0 {
                 break;
@@ -736,11 +788,20 @@ mod tests {
             expected_measurements: None,
         });
         tee_state
-            .add_participant(node_id.clone(), attestation, Duration::from_secs(0))
+            .add_participant(
+                node_id.clone(),
+                attestation,
+                Duration::from_secs(0),
+                Duration::from_secs(0),
+            )
             .unwrap();
 
         // When: cleanup runs while the attestation is still valid.
-        let removed = tee_state.clean_invalid_attestations(Duration::from_secs(0), 100);
+        let removed = tee_state.clean_invalid_attestations(
+            Duration::from_secs(0),
+            Duration::from_secs(0),
+            100,
+        );
 
         // Then: nothing is removed.
         assert_eq!(removed, 0);
@@ -770,6 +831,7 @@ mod tests {
             participant_id.clone(),
             local_attestation.clone(),
             TEE_UPGRADE_DURATION,
+            Duration::from_secs(0),
         );
         assert_matches!(
             insertion_result,
@@ -781,6 +843,7 @@ mod tests {
             participant_id.clone(),
             local_attestation.clone(),
             TEE_UPGRADE_DURATION,
+            Duration::from_secs(0),
         );
 
         // then
@@ -803,7 +866,12 @@ mod tests {
 
         // when
         tee_state
-            .add_participant(node_id, attestation, Duration::from_secs(0))
+            .add_participant(
+                node_id,
+                attestation,
+                Duration::from_secs(0),
+                Duration::from_secs(0),
+            )
             .unwrap();
 
         // then
@@ -827,7 +895,12 @@ mod tests {
 
         // when
         tee_state
-            .add_participant(node_id.clone(), attestation, Duration::from_secs(0))
+            .add_participant(
+                node_id.clone(),
+                attestation,
+                Duration::from_secs(0),
+                Duration::from_secs(0),
+            )
             .unwrap();
 
         // then
@@ -852,7 +925,12 @@ mod tests {
 
         // when
         tee_state
-            .add_participant(node_id.clone(), attestation, Duration::from_secs(0))
+            .add_participant(
+                node_id.clone(),
+                attestation,
+                Duration::from_secs(0),
+                Duration::from_secs(0),
+            )
             .unwrap();
 
         // then
@@ -890,12 +968,14 @@ mod tests {
                 node_1.clone(),
                 Attestation::Mock(MockAttestation::Valid),
                 Duration::from_secs(0),
+                Duration::from_secs(0),
             )
             .unwrap();
         tee_state
             .add_participant(
                 node_2.clone(),
                 Attestation::Mock(MockAttestation::Valid),
+                Duration::from_secs(0),
                 Duration::from_secs(0),
             )
             .unwrap();
@@ -936,11 +1016,20 @@ mod tests {
         });
 
         tee_state
-            .add_participant(node_id.clone(), attestation, Duration::from_secs(0))
+            .add_participant(
+                node_id.clone(),
+                attestation,
+                Duration::from_secs(0),
+                Duration::from_secs(0),
+            )
             .unwrap();
 
         // when
-        let status = tee_state.reverify_participants(&node_id, Duration::from_secs(0));
+        let status = tee_state.reverify_participants(
+            &node_id,
+            Duration::from_secs(0),
+            Duration::from_secs(0),
+        );
 
         // then
         assert_eq!(status, TeeQuoteStatus::Valid);
@@ -969,7 +1058,12 @@ mod tests {
         });
 
         tee_state
-            .add_participant(node_id.clone(), attestation, Duration::from_secs(0))
+            .add_participant(
+                node_id.clone(),
+                attestation,
+                Duration::from_secs(0),
+                Duration::from_secs(0),
+            )
             .unwrap();
 
         // when
@@ -982,7 +1076,11 @@ mod tests {
                 .build()
         );
 
-        let status = tee_state.reverify_participants(&node_id, Duration::from_secs(0));
+        let status = tee_state.reverify_participants(
+            &node_id,
+            Duration::from_secs(0),
+            Duration::from_secs(0),
+        );
 
         // then
         assert_matches!(status, TeeQuoteStatus::Invalid(_));
@@ -1014,7 +1112,12 @@ mod tests {
         });
 
         tee_state
-            .add_participant(node_id.clone(), attestation, Duration::from_secs(0))
+            .add_participant(
+                node_id.clone(),
+                attestation,
+                Duration::from_secs(0),
+                Duration::from_secs(0),
+            )
             .unwrap();
 
         // when
@@ -1022,7 +1125,11 @@ mod tests {
             .block_timestamp(Duration::from_secs(EXPIRY_TIMESTAMP_SECONDS - 1).as_nanos() as u64)
             .build());
 
-        let status = tee_state.reverify_participants(&node_id, Duration::from_secs(0));
+        let status = tee_state.reverify_participants(
+            &node_id,
+            Duration::from_secs(0),
+            Duration::from_secs(0),
+        );
 
         // then
         assert_eq!(status, TeeQuoteStatus::Valid);
@@ -1039,7 +1146,11 @@ mod tests {
         };
 
         // when
-        let status = tee_state.reverify_participants(&node_id, Duration::from_secs(0));
+        let status = tee_state.reverify_participants(
+            &node_id,
+            Duration::from_secs(0),
+            Duration::from_secs(0),
+        );
 
         // then
         assert_matches!(status, TeeQuoteStatus::Invalid(msg) if msg.contains("participant has no attestation"));
@@ -1071,6 +1182,7 @@ mod tests {
                 node_id,
                 Attestation::Mock(MockAttestation::Valid),
                 tee_upgrade_duration,
+                Duration::from_secs(0),
             )
             .expect("Attestation is valid on insertion");
 
@@ -1136,6 +1248,7 @@ mod tests {
                 node_id,
                 Attestation::Mock(MockAttestation::Valid),
                 tee_upgrade_duration,
+                Duration::from_secs(0),
             )
             .expect("Attestation is valid on insertion");
 
@@ -1172,6 +1285,7 @@ mod tests {
                 node_id,
                 Attestation::Mock(MockAttestation::Valid),
                 tee_upgrade_duration,
+                Duration::from_secs(0),
             )
             .expect("Attestation is valid on insertion");
 
@@ -1219,12 +1333,16 @@ mod tests {
                     node_id,
                     Attestation::Mock(MockAttestation::Valid),
                     tee_upgrade_duration,
+                    Duration::from_secs(0),
                 )
                 .expect("mock attestation is valid");
         }
 
-        let validation_result =
-            tee_state.reverify_and_cleanup_participants(&participants, TEST_GRACE_PERIOD);
+        let validation_result = tee_state.reverify_and_cleanup_participants(
+            &participants,
+            TEST_GRACE_PERIOD,
+            Duration::from_secs(0),
+        );
 
         assert_matches!(validation_result, TeeValidationResult::Full);
     }
@@ -1244,13 +1362,17 @@ mod tests {
                     node_id,
                     Attestation::Mock(MockAttestation::Valid),
                     tee_upgrade_duration,
+                    Duration::from_secs(0),
                 )
                 .expect("mock attestation is valid");
         }
         // Third participant has no attestation
 
-        let validation_result =
-            tee_state.reverify_and_cleanup_participants(&participants, TEST_GRACE_PERIOD);
+        let validation_result = tee_state.reverify_and_cleanup_participants(
+            &participants,
+            TEST_GRACE_PERIOD,
+            Duration::from_secs(0),
+        );
 
         let expected_valid_account_ids = account_ids(&participants)[..2].to_vec();
         assert_matches!(
@@ -1278,6 +1400,7 @@ mod tests {
                     node_id,
                     Attestation::Mock(MockAttestation::Valid),
                     tee_upgrade_duration,
+                    Duration::from_secs(0),
                 )
                 .expect("mock attestation is valid");
         }
@@ -1292,14 +1415,22 @@ mod tests {
             expected_measurements: None,
         });
         tee_state
-            .add_participant(node_id, expiring_attestation, tee_upgrade_duration)
+            .add_participant(
+                node_id,
+                expiring_attestation,
+                tee_upgrade_duration,
+                Duration::from_secs(0),
+            )
             .expect("mock attestation is valid");
 
         // Advance time to exact expiry boundary
         set_block_timestamp(expiry_time_secs * 1_000_000_000);
 
-        let validation_result =
-            tee_state.reverify_and_cleanup_participants(&participants, TEST_GRACE_PERIOD);
+        let validation_result = tee_state.reverify_and_cleanup_participants(
+            &participants,
+            TEST_GRACE_PERIOD,
+            Duration::from_secs(0),
+        );
 
         let expected_valid_account_ids = account_ids(&participants)[..2].to_vec();
         assert_matches!(
@@ -1335,15 +1466,23 @@ mod tests {
                 Attestation::Mock(MockAttestation::Valid)
             };
             tee_state
-                .add_participant(node_id, attestation, tee_upgrade_duration)
+                .add_participant(
+                    node_id,
+                    attestation,
+                    tee_upgrade_duration,
+                    Duration::from_secs(0),
+                )
                 .expect("mock attestation is valid");
         }
 
         // Advance time, but still before expiry
         set_block_timestamp(before_expiry_time_secs * 1_000_000_000);
 
-        let validation_result =
-            tee_state.reverify_and_cleanup_participants(&participants, TEST_GRACE_PERIOD);
+        let validation_result = tee_state.reverify_and_cleanup_participants(
+            &participants,
+            TEST_GRACE_PERIOD,
+            Duration::from_secs(0),
+        );
 
         assert_matches!(
             validation_result,
@@ -1370,6 +1509,7 @@ mod tests {
                 alice_node.clone(),
                 Attestation::Mock(MockAttestation::Valid),
                 TEE_UPGRADE_DURATION,
+                Duration::from_secs(0),
             )
             .expect("initial insertion should succeed");
 
@@ -1383,6 +1523,7 @@ mod tests {
             attacker_node,
             Attestation::Mock(MockAttestation::Valid),
             TEE_UPGRADE_DURATION,
+            Duration::from_secs(0),
         );
 
         // Then: the overwrite is rejected and the original entry is untouched.
@@ -1415,6 +1556,7 @@ mod tests {
                 initial_node,
                 Attestation::Mock(MockAttestation::Valid),
                 TEE_UPGRADE_DURATION,
+                Duration::from_secs(0),
             )
             .expect("initial insertion should succeed");
 
@@ -1428,6 +1570,7 @@ mod tests {
             rotated_node.clone(),
             Attestation::Mock(MockAttestation::Valid),
             TEE_UPGRADE_DURATION,
+            Duration::from_secs(0),
         );
 
         // Then: the update is accepted and the stored entry reflects the new key.
@@ -1454,6 +1597,7 @@ mod tests {
                     node_id,
                     Attestation::Mock(MockAttestation::Valid),
                     tee_upgrade_duration,
+                    Duration::from_secs(0),
                 )
                 .expect("mock attestation is valid");
         }
@@ -1465,6 +1609,7 @@ mod tests {
             node_id,
             Attestation::Mock(MockAttestation::Invalid),
             tee_upgrade_duration,
+            Duration::from_secs(0),
         );
 
         assert_matches!(

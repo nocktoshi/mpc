@@ -14,5 +14,8 @@ pub fn dummy_config(value: u64) -> near_mpc_contract_interface::types::Config {
         cleanup_orphaned_node_migrations_tera_gas: value + 10,
         remove_non_participant_update_votes_tera_gas: value + 11,
         clean_foreign_chain_data_tera_gas: value + 12,
+        // Must satisfy `Config::validate` (>= DEFAULT_EXPIRATION_DURATION_SECONDS = 7 days).
+        launcher_hash_unused_ttl_seconds: value + (14 * 24 * 60 * 60),
+        clean_expired_launcher_hashes_tera_gas: value + 13,
     }
 }

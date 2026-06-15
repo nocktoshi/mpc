@@ -29,7 +29,6 @@ use crate::{
         ProtocolContractState, initializing::InitializingContractState,
         resharing::ResharingContractState, running::RunningContractState,
     },
-    tee::tee_state::TeeState,
     update::ProposedUpdates,
 };
 
@@ -52,6 +51,64 @@ use crate::{
 #[derive(Debug, BorshSerialize, BorshDeserialize)]
 struct OldThresholdParametersVotes {
     proposal_by_account: BTreeMap<AuthenticatedAccountId, ThresholdParameters>,
+}
+
+/// `3.11.2` layout of `AllowedLauncherImage`: the current type appends `added` and
+/// `last_attested` timestamps, so the real type can no longer decode old bytes.
+#[derive(Debug, BorshSerialize, BorshDeserialize)]
+struct OldAllowedLauncherImage {
+    launcher_hash: mpc_primitives::hash::LauncherImageHash,
+    compose_hashes: Vec<mpc_primitives::hash::LauncherDockerComposeHash>,
+}
+
+#[derive(Debug, BorshSerialize, BorshDeserialize)]
+struct OldAllowedLauncherImages {
+    entries: Vec<OldAllowedLauncherImage>,
+}
+
+/// `3.11.2` layout of `TeeState`. Only `allowed_launcher_images` changed borsh
+/// layout; every other field reuses the real (byte-identical) type. Field order
+/// must match [`crate::tee::tee_state::TeeState`] exactly.
+#[derive(Debug, BorshSerialize, BorshDeserialize)]
+struct OldTeeState {
+    allowed_docker_image_hashes: crate::tee::proposal::AllowedDockerImageHashes,
+    allowed_launcher_images: OldAllowedLauncherImages,
+    votes: crate::tee::proposal::CodeHashesVotes,
+    launcher_votes: crate::tee::proposal::LauncherHashVotes,
+    stored_attestations: near_sdk::store::IterableMap<
+        near_mpc_contract_interface::types::Ed25519PublicKey,
+        crate::tee::tee_state::NodeAttestation,
+    >,
+    allowed_measurements: crate::tee::measurements::AllowedMeasurements,
+    measurement_votes: crate::tee::measurements::MeasurementVotes,
+}
+
+impl From<OldTeeState> for crate::tee::tee_state::TeeState {
+    fn from(old: OldTeeState) -> Self {
+        let now = crate::primitives::time::Timestamp::now();
+        let entries = old
+            .allowed_launcher_images
+            .entries
+            .into_iter()
+            .map(|e| crate::tee::proposal::AllowedLauncherImage {
+                launcher_hash: e.launcher_hash,
+                compose_hashes: e.compose_hashes,
+                added: now,
+                last_attested: now,
+            })
+            .collect();
+        crate::tee::tee_state::TeeState {
+            allowed_docker_image_hashes: old.allowed_docker_image_hashes,
+            allowed_launcher_images: crate::tee::proposal::AllowedLauncherImages::from_entries(
+                entries,
+            ),
+            votes: old.votes,
+            launcher_votes: old.launcher_votes,
+            stored_attestations: old.stored_attestations,
+            allowed_measurements: old.allowed_measurements,
+            measurement_votes: old.measurement_votes,
+        }
+    }
 }
 
 impl From<OldThresholdParametersVotes> for ThresholdParametersVotes {
@@ -115,7 +172,7 @@ pub struct MpcContract {
     proposed_updates: ProposedUpdates,
     node_foreign_chain_support: SupportedForeignChainsByNode,
     config: Config,
-    tee_state: TeeState,
+    tee_state: OldTeeState,
     accept_requests: bool,
     node_migrations: NodeMigrations,
     metrics: Metrics,
@@ -136,7 +193,7 @@ impl From<MpcContract> for crate::MpcContract {
             proposed_updates: old.proposed_updates,
             node_foreign_chain_support: old.node_foreign_chain_support,
             config: old.config,
-            tee_state: old.tee_state,
+            tee_state: old.tee_state.into(),
             accept_requests: old.accept_requests,
             node_migrations: old.node_migrations,
             metrics: old.metrics,
